@@ -1,0 +1,1023 @@
+---
+title: "TCGA data analysis"
+author: "Tianle Ma"
+date: "March 23, 2017"
+output: html_document
+---
+
+# Load packages
+```{r}
+library(SummarizedExperiment)
+library(biomaRt)
+library(DESeq2)
+library(igraph)
+library(pheatmap)
+library(ReactomePA)
+```
+
+
+# Prepare RangedSummarizedExperiment data
+```{r}
+## First download RNA-seq experiment data from ExpressionAtlas: "https://www.ebi.ac.uk/gxa/experiments/E-GEOD-30573/E-GEOD-30573-atlasExperimentSummary.Rdata"
+# Load data
+load("E-GEOD-30573-atlasExperimentSummary.Rdata")
+autism <- experimentSummary$rnaseq
+remove(experimentSummary)
+
+### Preprocessing
+## Remove genes with distinct ENSEMBL IDs but identical HGNC symbols to avoid suspicious correlation of nearly 1
+# RNA-seq fastq reads were mapped to ENSEMBL version 79
+ensembl79=useMart(host='mar2015.archive.ensembl.org', biomart='ENSEMBL_MART_ENSEMBL', dataset='hsapiens_gene_ensembl')
+id.map <- getBM(attributes= c("ensembl_gene_id", "hgnc_symbol"), filters="ensembl_gene_id", values=rownames(autism), mart=ensembl79)
+
+## Many ensg ids do not have a hgnc symbol
+# sum(id.map$hgnc_symbol != "")
+id.map <- id.map[id.map$hgnc_symbol != "",]
+## Many ensg ids has duplicated hgnc symbols
+id.map <- id.map[!duplicated(id.map$hgnc_symbol),]
+## Some hgnc symbols correspond to multiple ensg ids
+# id.map[duplicated(id.map$ensembl_gene_id) | duplicated(id.map$ensembl_gene_id, fromLast=T),]
+id.map <- id.map[!duplicated(id.map$ensembl_gene_id),]
+
+## Remove genes with zero count
+id.map <- id.map[!(id.map$ensembl_gene_id %in% rownames(autism)[rowSums(assay(autism)) == 0]),]
+rownames(id.map) <- id.map$ensembl_gene_id
+
+# Entrezgene and hgnc_symbol or ensembl_gene_id are many-to-many mapping
+hgnc2entrez <- getBM(attributes = c("hgnc_symbol", "entrezgene"), filters = "hgnc_symbol", values = as.character(id.map[,"hgnc_symbol"]), mart=ensembl79)
+
+## RangedSummarizedExperiment
+se <- autism[id.map$ensembl_gene_id,]
+```
+
+# Differential Expression Analysis (DEA)
+```{r}
+dds <- DESeqDataSet(se, design = ~ clinical_information + disease)
+## Many low counts genes are duplicated
+# plot(rowSums(counts(dds))[duplicated(counts(dds))])
+## Prefilter genes with low counts
+## This filter (rowSums(counts(dds)) > 8) is based exploratory data analysis. One can adjust it based on their own data.
+dds <- dds[ rowSums(counts(dds)) > 8, ]
+
+## Differential Expression Analysis using DESeq2
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("disease", "autism", "normal"), lfcThreshold = 0, alpha = 0.05)
+de.genes <- rownames(res)[!is.na(res$padj) & res$padj < 0.05]
+
+## autism_top_genes.csv downloaded from paper: Krishnan A*, Zhang R*, Yao V, Theesfeld CL, Wong AK, Tadych A, Volfovsky N, Packer A, Lash A, Troyanskaya OG.(2016) Genome-wide prediction and functional characterization of the genetic basis of autism spectrum disorder. Nature Neuroscience.
+#  topgenes <- read.csv("autism_top_genes.csv")
+## Examine DE gene overlap with top 7000 genes identidied by Troyanskaya lab.
+# library(gplots)
+# venn(list(id.map[de.genes,2], as.character(topgenes$Gene)[1:7000]))
+
+## rlog transformation
+rld <- rlog(dds)
+
+## ************ Figure 4 in the paper *************
+## Sample PCA plot
+plotPCA(rld, intgroup = c("disease", "clinical_information"))
+```
+
+# Unfiltered regulatory network
+```{r}
+## ENCODE.txt, CHEA.txt, JASPAR.txt, TRANSFAC.txt, TRANSFAC_pred.txt, MotifMap.txt, were downloaded from http://amp.pharm.mssm.edu/Harmonizome/
+encode1 <- read.table("sources/ENCODE.txt", header = T)
+encode1 <- encode1[-1, c(1,4)]
+colnames(encode1) <- c("target", "regulator")
+
+chea <- read.table("sources/CHEA.txt", header = T)
+chea <- chea[-1, c(1,4)]
+colnames(chea) <- c("target", "regulator")
+
+tmp <- read.table("sources/JASPAR.txt", header = T)
+jaspar <- tmp[-1, c(1,4)]
+colnames(jaspar) <- c("target", "regulator")
+
+tmp <- read.table("sources/TRANSFAC.txt", header = T)
+transfac <- tmp[-1, c(1,4)]
+colnames(transfac) <- c("target", "regulator")
+
+tmp <- read.table("sources/TRANSFAC_pred.txt", header = T)
+transfac_pred <- tmp[-1, c(1,4)]
+colnames(transfac_pred) <- c("target", "regulator")
+
+tmp <- read.table("sources/MotifMap.txt", header = T, sep = '\t')
+motifmap <- tmp[-1, c(1,4)]
+colnames(motifmap) <- c("target", "regulator")
+
+## trrust_rawdata.txt were downloaded from http://www.grnpedia.org/trrust/
+tmp <- read.table("sources/trrust_rawdata.txt")
+trrust <- tmp[,c(2,1)]
+names(trrust) <- c("target","regulator")
+
+## Additional two ENCODE regulator-target networks were downloaded from http://regulatorycircuits.org/
+encode2 <- read.table("sources/ENCODE-nets.proximal_filtered.distal.txt")
+colnames(encode2) <- c("regulator", "target")
+encode2 <- encode2[,c(2,1)]
+
+encode3 <- read.table("sources/ENCODE-nets.proximal_raw.distal.txt")
+colnames(encode3) <- c("regulator", "target")
+encode3 <- encode3[,c(2,1)]
+
+## Merge them together
+reg.global <- rbind(encode1, encode2, encode3, jaspar, motifmap, transfac, transfac_pred, chea, trrust)
+reg.global <- unique(reg.global)
+reg.global <- reg.global[-which(is.na(reg.global$regulator)),]
+
+## RegNetwork is from paper: RegNetwork: an integrated database of transcriptional and post-transcriptional regulatory networks in human and mouse. Database (Oxford). 2015 Sep 30;2015. pii: bav095. doi: 10.1093/database/bav095.
+regnetwork <- read.table("source/regnetwork.txt")
+regnetwork <- regnetwork[,c(1,3)]
+names(regnetwork) <- c("regulator", "target")
+
+## Merge the two networks
+regnet <- rbind(regnetwork, reg.global[,c(2,1)])
+regnet <- unique(regnet)
+regnet$regulator <- as.character(regnet$regulator)
+regnet$target <- as.character(regnet$target)
+## 2481 regulators, 28783 targets (including 2052 targets), 2822412 edges
+length(unique(regnet$regulator))
+length(unique(regnet$target))
+length(intersect(unique(regnet$regulator), unique(regnet$target)))
+## There are self-loops
+# sum(regnet$regulator == regnet$target)
+```
+
+Visualize part of the global regulatory network consisting of 2052 genes that are both in the regulator set and target set.
+```{r}
+nodes.global <- unique(regnet$regulator)
+tmp <- which(regnet$target %in% regnet$regulator)
+edges.global <- data.frame(from=regnet$regulator[tmp], to=regnet$target[tmp], weight=1)
+net.global <- graph_from_data_frame(d=edges.global, vertices = nodes.global, directed = T)
+plot(net.global)
+```
+
+
+# Extract a subnetwork consisting of DE genes
+```{r}
+rownames(id.map) <- id.map$ensembl_gene_id
+reg.tar <- regnet[(regnet$target %in% id.map[de.genes, 2]) & (regnet$regulator %in% id.map[de.genes, 2]),]
+# remove self-loops
+reg.tar <- reg.tar[reg.tar$regulator!=reg.tar$target,]
+# User-friendly rownames
+rownames(reg.tar) <- paste(reg.tar$regulator, reg.tar$target, sep = "-")
+rownames(id.map) <- id.map$hgnc_symbol
+reg.tar$reg.ensg <- id.map[reg.tar$regulator,1]
+reg.tar$tar.ensg <- id.map[reg.tar$target,1]
+
+# 461 regulators, 6766 targets (including all 461 regulators), 358714 edges
+reg.list <- split(reg.tar$tar.ensg, reg.tar$reg.ensg)
+tar.list <- split(reg.tar$reg.ensg, reg.tar$tar.ensg)
+length(intersect(names(reg.list), names(tar.list)))
+```
+
+# Filter regulator-target edges with low co-expression values
+```{r}
+## Coexpression network using all samples
+samplelist <- 1:12
+cor.mat <- cor(t(assay(rld)[de.genes, samplelist]))
+cor.mat[lower.tri(cor.mat, diag = T)] <- 0
+
+reg.tar$cor <- cor.mat[as.matrix(reg.tar[,3:4])] + cor.mat[as.matrix(reg.tar[,c(4,3)])]
+reg.tar$pval <- 2 * pt(-abs(reg.tar$cor) / sqrt(1-reg.tar$cor^2) * sqrt(length(samplelist)-2), length(samplelist)-2)
+## Calculate FDR
+reg.tar$padj <- p.adjust(reg.tar$pval, method = "fdr")
+## Find out cor.threshold with FDR < 0.01 is 0.7682
+# reg.tar[abs(reg.tar$padj - 0.01) < 1e-6, ]
+
+## Correlation in unfiltered global network V.S. background correlation network
+cor.all <- cor(t(assay(rld)))
+cor.all <- cor.all[upper.tri(cor.all)]
+mean(cor.all) # 6.503087e-05
+mean(reg.tar$cor) # -0.02327694
+mean(abs(cor.all)) # 0.42274
+mean(abs(reg.tar$cor)) # 0.6029107
+back.abs.mean.cor <- (length(cor.all) * mean(abs(cor.all)) - nrow(reg.tar) * mean(abs(reg.tar$cor))) / (length(cor.all) - nrow(reg.tar)) # 0.4224226
+## Could use T-test to measure the significance (memory-consuming)
+
+## Coexpression network using autism samples
+samplelist <- 1:6
+cor.mat <- cor(t(assay(rld)[de.genes, samplelist]))
+cor.mat[lower.tri(cor.mat, diag = T)] <- 0
+reg.tar$cor.autism <- cor.mat[as.matrix(reg.tar[,3:4])] + cor.mat[as.matrix(reg.tar[,c(4,3)])]
+reg.tar$pval.autism <- 2 * pt(-abs(reg.tar$cor.autism) / sqrt(1-reg.tar$cor.autism^2) * sqrt(length(samplelist)-2), length(samplelist)-2)
+reg.tar$padj.autism <- p.adjust(reg.tar$pval.autism, method = "fdr")
+
+## Coexpression network using normal samples
+samplelist <- 7:12
+cor.mat <- cor(t(assay(rld)[de.genes, samplelist]))
+cor.mat[lower.tri(cor.mat, diag = T)] <- 0
+reg.tar$cor.normal <- cor.mat[as.matrix(reg.tar[,3:4])] + cor.mat[as.matrix(reg.tar[,c(4,3)])]
+reg.tar$pval.normal <- 2 * pt(-abs(reg.tar$cor.normal) / sqrt(1-reg.tar$cor.normal^2) * sqrt(length(samplelist)-2), length(samplelist)-2)
+reg.tar$padj.normal <- p.adjust(reg.tar$pval.normal, method = "fdr")
+reg.tar$z.diff <- (0.5*log((1-reg.tar$cor.autism) / (1+reg.tar$cor.autism)) - 0.5*log((1-reg.tar$cor.normal) / (1+reg.tar$cor.normal))) / sqrt(1/3+1/3)
+sum(abs(reg.tar$z.diff)>qnorm(1-0.025))
+reg.tar$p.diff <- 2*pnorm(-abs(reg.tar$z.diff))
+
+## Generate co-expression filtered regulatory network
+# 199 regulators, 3579 targets (including 141 regulators), 12834 edges
+sum(reg.tar$padj < 0.05 & reg.tar$padj.autism < 0.1 & reg.tar$padj.normal < 0.1)
+# reg.tar[abs(reg.tar$padj.autism - 0.1)<1e-5,] # 0.86
+# reg.tar[abs(reg.tar$padj - 0.1)<1e-5,] # 0.553
+reg.tar.cor <- reg.tar[reg.tar$padj < 0.05 & reg.tar$padj.autism < 0.1 & reg.tar$padj.normal < 0.1, ]
+
+## Visualize coexpression network for autism condition
+net.cor.autism <- graph_from_data_frame(data.frame(from=reg.tar.cor$regulator, to=reg.tar.cor$target, weight=reg.tar.cor$cor.autism))
+V(net.cor.autism)$size <- 4
+E(net.cor.autism)$arrow.size <- 0.5
+E(net.cor.autism)$width <- abs(E(net.cor.autism)$weight)
+E(net.cor.autism)$color <- c("blue", "red")[(E(net.cor.autism)$weight>0)+1]
+## There are 21 connected components 
+tmp <- components(net.cor.autism)
+# Visualize the component with 13 nodes
+l_net.cor_13 <- layout_with_fr(induced.subgraph(net.cor.autism, V(net.cor.autism)[components(net.cor.autism)$membership==12]))
+plot(induced.subgraph(net.cor.autism, V(net.cor.autism)[components(net.cor.autism)$membership==12]), vertex.label.dist=.8, vertex.label.color="black", vertex.label.font=2, layout=l_net.cor_13)
+# Visualize the largest components with 3578 nodes
+l_net.cor_3578 <- layout_with_fr(induced.subgraph(net.cor.autism, V(net.cor.autism)[components(net.cor.autism)$membership==1]))
+plot(induced.subgraph(net.cor.autism, V(net.cor.autism)[components(net.cor.autism)$membership==1]), vertex.size=1, edge.arrow.size=.2, layout=l_net.cor_3578, vertex.label=NA)
+
+## Visualize network for normal condition
+net.cor.normal <- graph_from_data_frame(data.frame(from=reg.tar.cor$regulator, to=reg.tar.cor$target, weight=reg.tar.cor$cor.normal))
+V(net.cor.normal)$size <- 4
+E(net.cor.normal)$arrow.size <- 0.5
+E(net.cor.normal)$width <- abs(E(net.cor.normal)$weight)
+E(net.cor.normal)$color <- c("blue", "red")[(E(net.cor.normal)$weight>0)+1]
+## There are 21 connected components 
+tmp <- components(net.cor.normal)
+# Visualize the component with 13 nodes
+plot(induced.subgraph(net.cor.normal, V(net.cor.normal)[components(net.cor.normal)$membership==12]), vertex.label.dist=.8, vertex.label.color="black", vertex.label.font=2, layout=l_net.cor_13)
+# Compare the two conditions
+par(mfrow=c(1,2))
+plot(induced.subgraph(net.cor.normal, V(net.cor.normal)[components(net.cor.normal)$membership==12]), vertex.label.dist=.8, vertex.label.color="black", vertex.label.font=2, layout=l_net.cor_13, main="normal")
+plot(induced.subgraph(net.cor.autism, V(net.cor.autism)[components(net.cor.autism)$membership==12]), vertex.label.dist=.8, vertex.label.color="black", vertex.label.font=2, layout=l_net.cor_13, main="autism")
+# Visualize the largest components with 3578 nodes
+plot(induced.subgraph(net.cor.normal, V(net.cor.normal)[components(net.cor.normal)$membership==1]), vertex.size=1, edge.arrow.size=.2, layout=l_net.cor_3578, vertex.label=NA)
+
+## Visualize network for mixed condition
+net.cor.mixed <- graph_from_data_frame(data.frame(from=reg.tar.cor$regulator, to=reg.tar.cor$target, weight=reg.tar.cor$cor))
+V(net.cor.mixed)$size <- 1
+E(net.cor.mixed)$arrow.size <- 0.1
+E(net.cor.mixed)$width <- abs(E(net.cor.mixed)$weight) / 2
+E(net.cor.mixed)$color <- c("blue", "red")[(E(net.cor.mixed)$weight>0)+1]
+plot(net.cor.mixed, layout=layout_with_fr, vertex.label=NA)
+plot(induced.subgraph(net.cor.mixed, V(net.cor.mixed)[components(net.cor.mixed)$membership==1]), vertex.size=1, edge.arrow.size=.2, layout=l_net.cor_3578, vertex.label=NA)
+```
+
+# Coexpression network rewiring
+```{r}
+reg.tar.cor$padj.diff <- p.adjust(reg.tar.cor$p.diff, method = "fdr")
+# sum(abs(reg.tar.cor$z.diff)>qnorm(1-0.025))
+sum(reg.tar.cor$padj.diff < 0.01) # 1289
+idx <- which(reg.tar.cor$padj.diff < 0.01)
+
+## Visualization of differential correlation network
+## Using heatmap in pheatmap package
+## ************ Figure 5 in the paper *************
+set.seed(1)
+pheatmap(reg.tar.cor[,c("cor","cor.autism","cor.normal")], labels_col = c("Mixed", "Autism", "Normal"), show_rownames = F)
+## Normal network visualization with igraph
+edges <- data.frame(from=reg.tar.cor[idx, "regulator"], to=reg.tar.cor[idx,"target"], weight=reg.tar.cor[idx,"z.diff"])
+nodes <- data.frame(id=union(reg.tar.cor[idx, c("regulator")], reg.tar.cor[idx,c("target")]))
+net <- graph_from_data_frame(edges)
+E(net)$color <- colorRampPalette(c("blue","red"))(10)[as.numeric(cut(E(net)$weight, breaks = 10))]
+net.cor.rewired <- net
+## ************ Figure 6(a) in the paper *************
+set.seed(1)
+plot(net.cor.rewired, vertex.label=NA, vertex.size=1, edge.arrow.size=.1, layout=layout_with_fr)
+
+## Find the largest connected components
+net2 <- delete.vertices(net.cor.rewired, V(net.cor.rewired)[components(net.cor.rewired)$membership!=which.max(components(net.cor.rewired)$csize)])
+# plot(degree(net2)[order(degree(net2))])
+# cl <- cluster_edge_betweenness(net2, weights = abs(E(net2)$weight))
+# plot(cl, net2, layout=layout_with_fr, vertex.label=NA, vertex.size=1, edge.arrow.size=.1)
+# table(cl$membership)[order(table(cl$membership))]
+# net2 <- delete_vertices(net2, V(net2)[cl$membership!=2 & cl$membership!=3])
+# tmp <- res[id.map[match(names(V(net2)), id.map$hgnc_symbol), 1], "log2FoldChange"]
+# V(net2)$color <- colorRampPalette(c(rgb(1,1,1, .2),rgb(.8,0,0, .7)), alpha=TRUE)(5)[as.numeric(cut(tmp, breaks = 5))]
+V(net2)$size<-1
+V(net2)$size[degree(net2)>=20] <- log(degree(net2)[degree(net2)>=20])*2
+V(net2)$label <- NA
+V(net2)$label[degree(net2)>=20] <- names(V(net2))[degree(net2)>=20]
+V(net2)$color <- "grey"
+V(net2)$label.color <- "red"
+V(net2)$label.font <- 2
+E(net2)$arrow.size <- .1
+E(net2)$color <- "grey" #colorRampPalette(c("blue","red"))(10)[as.numeric(cut(E(net2)$weight, breaks = 10))]
+tkid <- tkplot(net2)
+l <- tkplot.getcoords(tkid)
+layout.diff.cor.sub <- l
+subnet.cor.rewired <- net2
+
+## ************ Figure 6(b) in the paper *************
+plot(subnet.cor.rewired, layout=layout.diff.cor.sub)
+
+# ## Validation
+# ## RXRA: http://bmcgenomics.biomedcentral.com/articles/10.1186/1471-2164-14-499
+# ## GSEA  
+# 
+# ## Compare with Princeton predictions
+# topgenes[match(names(V(net2))[degree(net2)>=20], topgenes$Gene),]
+# intersect(topgenes$Gene[1:100], nodes$id)
+# tmp <- 1:length(as.character(topgenes$Gene))
+# names(tmp) <- as.character(topgenes$Gene)
+# wilcox.test(tmp[as.character(nodes$id)]-sample(1:nrow(topgenes), length(V(net))))
+# 
+# ## Compare with newest nature paper: doi:10.1038/nature21678
+# intersect(c("NLGN3","APBA2","NLGN1","NLGN4X","NRXN1", "PTPRT", "NRXN2",
+#   "NRXN3","GRID1","EML1","GRIK2","DLG4","SHANK1","SHANK3","KCNJ10",
+#   "KCNJ2","GRIN2B","GRIN2A"), union(reg.tar[,"regulator"], reg.tar[,"target"]))
+# 
+# intersect(c("UBE3A", "HOMER1", "GRM1", "INADL", "GRID2"), union(reg.tar[,"regulator"], reg.tar[,"target"]))
+# which(reg.tar$regulator=="UBE3A")
+# 
+# ## Compare with safari genes
+```
+
+# Consturct context-specific regulatory network
+```{r}
+## rlog - mean rlog of healthy samples (corresponding to log2FoldChange)
+mat <- assay(rld)[de.genes, 1:12] - rowMeans(assay(rld)[de.genes, 7:12])
+set.seed(123)
+pheatmap(mat, kmeans_k = 30, annotation_col=as.data.frame(colData(rld)[,c("disease", "clinical_information")]), display_numbers = T)
+# # Evaluate clusters
+# # Two "natural" clusters: up- down-
+# samplelist <- 1:12
+# dat <- mat[,samplelist]
+# plotcluster(dat, (res[de.genes,"log2FoldChange"] > 0) + 1 )
+# clusplot(dat, (res[de.genes,"log2FoldChange"] > 0) + 1)
+# tmp <- prcomp(dat)
+# plot3d(tmp$x[,1:3], col=(res[de.genes,"log2FoldChange"] > 0) + 1, size = 5)
+# # Visualize clusters
+# set.seed(123)
+# k <- 30
+# km <- kmeans(dat,k, iter.max = 100)
+# E2 <- daisy(dat)^2
+# sk2   <- silhouette(km$cluster, E2)
+# plot(sk2)
+# plotcluster(dat, km$cluster)
+# clusplot(dat, km$cluster)
+# tmp <- prcomp(dat)
+# plot(tmp$x[,1:2], col=km$cluster)
+# plot3d(tmp$x[,1:3], col=km$cluster, size = 5)
+
+reg.sublist <- split(reg.tar.cor$tar.ensg, reg.tar.cor$reg.ensg)
+tar.sublist <- split(reg.tar.cor$reg.ensg, reg.tar.cor$tar.ensg)
+tar.sizes <- sapply(reg.sublist, length)
+genenames <- rownames(mat)
+genome.size <- length(genenames)
+
+## This function corresponds to Algorithm 1: learn weighted regulatory network
+## To save memory, we do not generate cluster pool in the beginning. Instead we test gene set overlap after each run of KMeans 
+weight.reg.tar <- function(m = mat, k = 30, k_sim = 1000, p = 0.01/199/30) {
+  reg.mat <- matrix(0, nrow = length(reg.sublist), ncol = length(tar.sublist))
+  rownames(reg.mat) <- names(reg.sublist)
+  colnames(reg.mat) <- names(tar.sublist)
+  for (n in 1:k_sim){
+    km <- kmeans(m, k, iter.max = 100)
+    for (i in 1:length(reg.sublist)) {
+      size = tar.sizes[i]
+      for (j in 1:k){
+        overlap <- intersect(reg.sublist[[i]], genenames[km$cluster==j])
+        if (phyper(length(overlap), size, genome.size-size, km$size[j], lower.tail = F) < p)
+          reg.mat[i, overlap] <- reg.mat[i, overlap] + 1/k_sim
+      }
+    }
+  }
+  return(reg.mat)
+}
+set.seed(1)
+# combined regulatory network (mixed condition)
+an.reg.mat <- weight.reg.tar()
+# Autistic regulatory network
+a.reg.mat <- weight.reg.tar(m = mat[,1:6])
+# Normal regulatory network
+n.reg.mat <- weight.reg.tar(m = mat[,7:12])
+```
+
+# Study the properties of learned regulatory networks
+```{r}
+# Visualize regulatory matrix (selecting 50 most variant regulators and 1000 most variant targets)
+reg.idx <- order(rowVars(an.reg.mat),decreasing = T)[1:50]
+tar.idx <- order(rowVars(t(an.reg.mat)),decreasing = T)[1:1000]
+## **************** Fig. 7 ****************
+set.seed(123)
+pheatmap(t(an.reg.mat[reg.idx,tar.idx]), kmeans_k = 5, display_numbers = T, cutree_rows = 5, cutree_cols = 5, labels_col = id.map[rownames(an.reg.mat)[reg.idx],2], main = "", fontsize_col = 10)
+set.seed(123)
+km <- kmeans(t(an.reg.mat[reg.idx, tar.idx]), 5)
+tmp1<- sapply(split(tar.idx, km$cluster), function(x)rowMeans(n.reg.mat[reg.idx,x]))
+tmp2<- sapply(split(tar.idx, km$cluster), function(x)rowMeans(an.reg.mat[reg.idx,x]))
+tmp3<- sapply(split(tar.idx, km$cluster), function(x)rowMeans(a.reg.mat[reg.idx,x]))
+pheatmap(cbind(tmp1,tmp2,tmp3)[,as.vector(sapply(1:5, function(x)seq(x,15,5)))], cluster_rows = F, cluster_cols = F, display_numbers = T, labels_row = id.map[rownames(an.reg.mat)[reg.idx],2], labels_col = as.vector(sapply(1:5, function(x)paste(c("Normal: clu.", "Mixed: clu.", "Autism: clu."),x))))
+
+# Visualize network
+tmp <- as.data.frame(as.table(an.reg.mat))
+an.reg.list <- tmp[match(paste0(reg.tar.cor[,"reg.ensg"], reg.tar.cor[,"tar.ensg"]), paste0(tmp$Var1, tmp$Var2)),]
+colnames(an.reg.list) <- c("reg.ensg", "tar.ensg", "weight")
+an.reg.list$regulator <- id.map[as.character(an.reg.list$reg.ensg), "hgnc_symbol"]
+an.reg.list$target <- id.map[as.character(an.reg.list$tar.ensg), "hgnc_symbol"]
+net.reg.an <- graph_from_data_frame(an.reg.list[,c("regulator", "target", "weight")])
+V(net.reg.an)$size <- 1
+E(net.reg.an)$arrow.size <- .1
+E(net.reg.an)$width <- E(net.reg.an)$weight * 2
+# delete edges with weight less than 0.1
+net.reg.an <- delete.edges(net.reg.an, E(net.reg.an)[weight<.1])
+library(RColorBrewer)
+E(net.reg.an)$color <- brewer.pal(3, "Blues")[as.numeric(cut(E(net.reg.an)$weight, 3))]
+set.seed(123)
+l_net.reg <- layout_with_drl(net.reg.an)
+par(mfrow=c(1,2))
+plot(net.cor.mixed, vertex.label = NA, layout=l_net.reg, vertex.size=1, edge.arrow.size=0, main="Coexpression Network for Mixed Condition")
+plot(net.reg.an, vertex.label = NA, layout=l_net.reg, vertex.size=1, edge.arrow.size=.1, main="Regulatory Network for Mixed Condition")
+# Study the biggest connected component (2536 nodes)
+subnet.reg.an <- induced.subgraph(net.reg.an, V(net.reg.an)[components(net.reg.an)$membership==which.max(components(net.reg.an)$csize)])
+set.seed(1)
+l_subnet.reg.an <- layout_with_drl(subnet.reg.an)
+plot(subnet.reg.an, edge.arrow.mode=0, vertex.label=NA, layout=l_subnet.reg.an)
+# cluster
+clu <- cluster_louvain(as.undirected(subnet.reg.an, mode='collapse'))
+# There is 7 clusters with more than 100 nodes
+# color the seven largest clusters
+V(subnet.reg.an)$color <- rep("grey50", vcount(subnet.reg.an))
+tmp <- 1:7
+tmp[order(table(clu$membership), decreasing=T)[1:7]] <- 1:7
+V(subnet.reg.an)$color[clu$membership %in% order(table(clu$membership), decreasing=T)[1:7]] <- brewer.pal(7,"Set1")[tmp[clu$membership[clu$membership %in% order(table(clu$membership), decreasing=T)[1:7]]]]
+plot(subnet.reg.an, edge.arrow.mode=0, vertex.label=NA, layout=l_subnet.reg.an, main="Largest Connected Component of Regulatory Network")
+# Change the edge color as the source node color
+ecol <- rep("grey50", ecount(subnet.reg.an))
+for (v in V(subnet.reg.an)){
+  idx <- match(incident(subnet.reg.an, v, mode="out"), E(subnet.reg.an))
+  ecol[idx] <- rep(V(subnet.reg.an)$color[v], length(idx))
+}
+E(subnet.reg.an)$color <- ecol
+# plot colored network
+par(mfrow=c(1,2))
+plot(net.reg.an, vertex.label = NA, layout=l_net.reg, vertex.size=1, edge.arrow.size=.1, main="Regulatory Network for Mixed Condition")
+plot(subnet.reg.an, vertex.label = NA, layout = l_subnet.reg.an, vertex.size=1, edge.arrow.size=.1, main="Largest Connected Component of Regulatory Network")
+# The largest four clusters
+subsubnet.reg.an <- induced.subgraph(subnet.reg.an, V(subnet.reg.an)[clu$membership %in% order(table(clu$membership), decreasing=T)[1:4]])
+set.seed(100)
+l_subsubnet.reg.an <- layout_with_drl(subsubnet.reg.an)
+# plot the largest four clusters
+par(mfrow=c(1,2))
+plot(subsubnet.reg.an, vertex.label = NA, vertex.size=1, edge.arrow.mode=0, layout=l_subsubnet.reg.an)
+plot(subnet.reg.an, vertex.label = NA, vertex.size=1, edge.arrow.mode=0, layout=l_subnet.reg.an)
+
+
+## For autistic condition
+tmp <- as.data.frame(as.table(a.reg.mat))
+tmp <- tmp[match(paste0(reg.tar.cor$reg.ensg, reg.tar.cor$tar.ensg),paste0(tmp$Var1, tmp$Var2)),]
+tmp$regulator <- id.map[as.character(tmp$Var1), "hgnc_symbol"]
+tmp$target <- id.map[as.character(tmp$Var2), "hgnc_symbol"]
+colnames(tmp)[3] <- "weight"
+net.reg.a <- graph_from_data_frame(tmp[,c("regulator", "target", "weight")])
+hist(E(net.reg.a)$weight)
+V(net.reg.a)$size <- 1
+E(net.reg.a)$width <- E(net.reg.a)$weight * 2
+# filter out edges with weight less than 0.1
+net.reg.a <- delete.edges(net.reg.a, E(net.reg.a)[weight<0.1])
+E(net.reg.a)$color <- brewer.pal(3, "Blues")[as.numeric(cut(E(net.reg.a)$weight, 3))]
+plot(net.reg.a, vertex.label=NA, edge.arrow.mode=0)
+# the largest connected component 
+subnet.reg.a <- induced.subgraph(net.reg.a, components(net.reg.a)$membership==which.max(components(net.reg.a)$csize))
+# cluster
+clu.a <- cluster_louvain(as.undirected(subnet.reg.a, mode = "collapse"))
+# 7 clusters with size larger than 100
+# color these seven clusters
+V(subnet.reg.a)$color <- "grey50"
+tmp <- rep(0,max(order(table(clu.a$membership), decreasing = T)[1:7]))
+tmp[order(table(clu.a$membership), decreasing = T)[1:7]] <- 1:7
+V(subnet.reg.a)[clu.a$membership %in% order(table(clu.a$membership), decreasing = T)[1:7]]$color <- brewer.pal(7, "Set1")[tmp[clu.a$membership[clu.a$membership %in% order(table(clu.a$membership),decreasing = T)[1:7]]]]
+# color edges with the color of source node
+for (v in V(subnet.reg.a)){
+  idx <- match(incident(subnet.reg.a, v, mode = "out"), E(subnet.reg.a))
+  E(subnet.reg.a)[idx]$color <- V(subnet.reg.a)$color[v]
+}
+plot(subnet.reg.a, vertex.label=NA, edge.arrow.mode=0)
+# the largest five clusters
+subsubnet.reg.a <- induced.subgraph(subnet.reg.a, V(subnet.reg.a)[clu.a$membership %in% order(table(clu.a$membership),decreasing = T)[1:5]])
+set.seed(999)
+l_subsubnet.reg.a <- layout_with_drl(subsubnet.reg.a)
+plot(subsubnet.reg.a, vertex.label=NA, edge.arrow.mode=0, layout=l_subsubnet.reg.a)
+
+
+## Normal samples
+tmp <- as.data.frame(as.table(n.reg.mat))
+tmp <- tmp[match(paste0(reg.tar.cor$reg.ensg, reg.tar.cor$tar.ensg), paste0(tmp$Var1, tmp$Var2)),]
+tmp$regulator <- id.map[as.character(tmp$Var1), "hgnc_symbol"]
+tmp$target <- id.map[as.character(tmp$Var2), "hgnc_symbol"]
+colnames(tmp)[3] <- "weight"
+net.reg.n <- graph_from_data_frame(tmp[,c("regulator", "target", "weight")])
+# filter edges with weight < 0.1
+net.reg.n <- delete.edges(net.reg.n, E(net.reg.n)[weight<0.1])
+V(net.reg.n)$size <- 1
+E(net.reg.n)$width <- E(net.reg.n)$weight * 2
+# Study the largest connected component
+subnet.reg.n <- induced.subgraph(net.reg.n, V(net.reg.n)[components(net.reg.n)$membership == which.max(components(net.reg.n)$csize)])
+# cluster
+clu.n <- cluster_louvain(as.undirected(subnet.reg.n, mode = "collapse"))
+# 8 clusters with size > 100
+# color the nodes
+V(subnet.reg.n)$color <- "grey50"
+tmp <- rep(0, max(order(table(clu.n$membership), decreasing = T)[1:8]))
+tmp[order(table(clu.n$membership), decreasing = T)[1:8]] <- 1:8
+V(subnet.reg.n)[clu.n$membership %in% order(table(clu.n$membership), decreasing = T)[1:8]]$color <- brewer.pal(8, "Set1")[tmp[clu.n$membership[clu.n$membership %in% order(table(clu.n$membership), decreasing = T)[1:8]]]]
+# color the edges
+for (v in V(subnet.reg.n)){
+  idx <- match(incident(subnet.reg.n, v, mode = "out"), E(subnet.reg.n))
+  E(subnet.reg.n)[idx]$color <- V(subnet.reg.n)[v]$color
+}
+set.seed(1000)
+l_subnet.reg.n <- layout_with_drl(subnet.reg.n)
+plot(subnet.reg.n, layout=layout_with_drl, vertex.label=NA, edge.arrow.mode=0)
+# The largest 4 clusters
+subsubnet.reg.n <- induced.subgraph(subnet.reg.n, V(subnet.reg.n)[clu.n$membership %in% order(table(clu.n$membership), decreasing = T)[1:4]])
+set.seed(1000)
+l_subsubnet.reg.n <- layout_with_drl(subsubnet.reg.n)
+plot(subsubnet.reg.n, layout=layout_with_drl, vertex.label=NA, edge.arrow.mode=0)
+```
+
+# Reactome Pathway Analysis
+```{r}
+# pathway names
+pathways <- toTable(reactomePATHID2NAME)
+# select only human pathways
+pathways <- pathways[grepl("Homo sapiens", iconv(pathways$path_name)),]
+xx <- as.list(reactomePATHID2EXTID)
+# 204 pathway IDs were not in reactomePATHID2EXTID. Strange
+pathways <- pathways[pathways$DB_ID%in%names(xx),]
+rownames(pathways) <- pathways$DB_ID
+pathwaylist <- xx[pathways$DB_ID]
+# 9176 out of 10294 entrez gene ids were in autism study;
+# used for gene set overlap analysis
+
+# Function to calculate probability of overlap
+p.overlap <- function(N1, N2, n, M1, M2, m){
+  if (n > N1 | n > N2){
+    print("STOP! n > N1 or n > N2")
+    return(NULL)
+  }
+  if (m > M1 | m > M2){
+    print("STOP! m > m1 or m > m2")
+    return(NULL)
+  }
+  if (m > n){
+    print("STOP! m > n")
+    return(NULL)
+  }
+  P1 <- sapply(m:min(M1,n), function(x){dhyper(x, n, N1-n, M1)})
+  P1 <- t(matrix(rep(P1, length(m:min(M2,n))),nrow=length(m:min(M1,n)), ncol=length(m:min(M2,n))))
+  P2 <- sapply(m:min(M2,n), function(x){dhyper(x, n, N2-n, M2)})
+  P2 <- matrix(rep(P2, length(m:min(M1,n))),nrow=length(m:min(M2,n)))
+  P3 <- sapply(m:min(M1,n), function(x){
+    sapply(m:min(M2,n), function(y){
+      dhyper(m, x, n-x, y)
+    })
+  })
+  return(sum(P1 * P2 * P3))
+  ## slow
+  # p <- 0
+  # for (m1 in m:min(M1, n)){
+  #   for (m2 in m:min(M2, n)){
+  #     p <- p + dhyper(m1, n, N1-n, M1) * dhyper(m2, n, N2-n, M2) * dhyper(m, m1, n-m1, m2)
+  #   }
+  # }
+  # return(p)
+}
+
+N1 <- length(unique(unlist(pathwaylist)))
+N2 <- length(de.genes)
+n <- sum(unique(unlist(pathwaylist)) %in% hgnc2entrez[hgnc2entrez$hgnc_symbol %in% id.map[de.genes, "hgnc_symbol"],"entrezgene"])
+enrichR <- function(genecluster, pathwaylist)
+{
+  entrezids <- hgnc2entrez[hgnc2entrez$hgnc_symbol %in% genecluster,"entrezgene"]
+  entrezids <- entrezids[!is.na(entrezids)]
+  entrezids <- unique(entrezids)
+  M2 <- length(entrezids)
+  pvals <- rep(1, length(pathwaylist))
+  m <- rep(0, length(pathwaylist))
+  for (i in 1:length(pathwaylist)){
+    pathway<-pathwaylist[[i]]
+    M1 <- length(pathway)
+    m[i] <- length(intersect(pathway, entrezids))
+    if (m[i] > 0){
+      pvals[i] <- 1 - sum(sapply(0:(m[i]-1), function(x)p.overlap(N1, N2, n, M1, M2, x)))
+    }
+  }
+  return(data.frame(size_pathway=sapply(pathwaylist, length), num_genes=M2, comm_genes=m, pval=pvals))
+}
+ptm <- proc.time()
+enrich.a <- sapply(1:max(clu.a$membership), function(x){ enrichR(names(V(subnet.reg.a))[clu.a$membership==x], pathwaylist)})
+enrich.n <- sapply(1:max(clu.n$membership), function(x){ enrichR(names(V(subnet.reg.n))[clu.n$membership==x], pathwaylist)})
+enrich.an <- sapply(1:max(clu$membership), function(x){ enrichR(names(V(subnet.reg.an))[clu$membership==x], pathwaylist)})
+proc.time() - ptm
+```
+
+# Evaluating using STRING database
+```{r}
+library(STRINGdb)
+string_db <- STRINGdb$new(version="10", species=9606)
+STRINGdb$help(get_graph)
+net.string <- string_db$get_graph()
+STRINGdb$help(map)
+df.reg.a <- data.frame(gene=names(V(subnet.reg.a)), degree=degree(subnet.reg.a), size=V(subnet.reg.a)$size, color=V(subnet.reg.a)$color)
+reg.a.mapped <- string_db$map(df.reg.a, "gene", removeUnmappedRows = T)
+subnet.string <- string_db$get_subnetwork(reg.a.mapped$STRING_id)
+reg.a.mapped <- reg.a.mapped[match(names(V(subnet.string)), reg.a.mapped$STRING_id),]
+clunet.reg.a <- induced.subgraph(subnet.reg.a, V(subnet.reg.a)[names(V(subnet.reg.a)) %in% reg.a.mapped$gene])
+# Edge overlap
+edges_subnet.string <- get.data.frame(subnet.string, what = "edges")
+edges_clunet.reg.a <- get.data.frame(clunet.reg.a, what = "edges")
+# 647
+sum(!is.na(match(c(paste(reg.a.mapped$gene[match(edges_subnet.string$from, reg.a.mapped$STRING_id)], reg.a.mapped$gene[match(edges_subnet.string$to, reg.a.mapped$STRING_id)], sep = "--"), paste(reg.a.mapped$gene[match(edges_subnet.string$to, reg.a.mapped$STRING_id)], reg.a.mapped$gene[match(edges_subnet.string$from, reg.a.mapped$STRING_id)], sep = "--")), paste(edges_clunet.reg.a$from, edges_clunet.reg.a$to, sep = "--"))))
+
+res.clu <- matrix(nrow = length(table(reg.a.mapped$color)), ncol = 5)
+rownames(res.clu) <- names(table(reg.a.mapped$color))
+colnames(res.clu) <- c("num_vertices", "num_edges_string", "num_edges_reg", "comm_edges", "cor_degree")
+for (clu.color in names(table(reg.a.mapped$color))) {
+  df.clu <- reg.a.mapped[which(reg.a.mapped$color==clu.color), ]
+  subnet.string <- string_db$get_subnetwork(df.clu[,"STRING_id"])
+  # # some vertices are missing when extracting the subnetwork
+  # df.clu <- reg.a.mapped[reg.a.mapped$STRING_id %in% names(V(subnet.string)),]
+  set.seed(123)
+  subnet.string.random <- string_db$get_subnetwork(reg.a.mapped[sample(1:nrow(reg.a.mapped), nrow(df.clu)), "STRING_id"])
+  clunet.reg.a <- induced.subgraph(subnet.reg.a, V(subnet.reg.a)[names(V(subnet.reg.a))%in% df.clu[,"gene"]])
+  if (vcount(clunet.reg.a) != vcount(subnet.string))
+    stop("vcount(clunet.reg.a) != vcount(subnet.string)")
+  res.clu[clu.color, "num_vertices"] <- vcount(subnet.string)
+  res.clu[clu.color, "num_edges_string"] <- ecount(subnet.string)
+  res.clu[clu.color, "num_edges_reg"] <- ecount(clunet.reg.a)
+  # network properties
+  deg.string <- degree(subnet.string)
+  names(deg.string) <- reg.a.mapped$gene[match(names(deg.string), reg.a.mapped$STRING_id)]
+  deg.reg <- degree(clunet.reg.a)
+  res.clu[clu.color, "cor_degree"] <- cor(deg.string[names(deg.reg)], deg.reg, method = "spearman")
+  # Find overlapping edges
+  edges_subnet.string <- get.data.frame(subnet.string, what = "edges")
+  edges_clunet.reg.a <- get.data.frame(clunet.reg.a, what = "edges")
+  # only 24?
+  res.clu[clu.color, "comm_edges"] <- sum(!is.na(match(c(paste(df.clu$gene[match(edges_subnet.string$from, df.clu$STRING_id)], df.clu$gene[match(edges_subnet.string$to, df.clu$STRING_id)], sep = "--"), paste(df.clu$gene[match(edges_subnet.string$to, df.clu$STRING_id)], df.clu$gene[match(edges_subnet.string$from, df.clu$STRING_id)], sep = "--")), paste(edges_clunet.reg.a$from, edges_clunet.reg.a$to, sep = "--"))))
+  
+  set.seed(123)
+  l_subnet.string <- layout_with_fr(subnet.string)
+  set.seed(123)
+  l2_subnet.string <- layout_with_drl(subnet.string)
+  png(filename=paste0(getwd(), "/latex/figs_extended/string-subnet_reg_a/", clu.color, ".png"), width = 2048, height = 1024)
+  par(mfrow=c(2,3))
+  # use layout_with_fr
+  plot(subnet.string.random, vertex.size=2, vertex.color = "blue", vertex.label=NA, layout=l_subnet.string, main=paste("Random subnetwork from STRING (", vcount(subnet.string), "nodes )"))
+  plot(subnet.string, vertex.size=2, vertex.color = clu.color, vertex.label=NA, layout=l_subnet.string, main=paste("Mapped subnetwork from STRING (", vcount(subnet.string), "nodes )"))
+  plot(clunet.reg.a, vertex.size=2, vertex.label=NA, edge.arrow.size=0.1, edge.curved=0.1, edge.color="grey50", layout=l_subnet.string, main=paste("Learned regulatory subnetwork (", vcount(subnet.string), "nodes )"))
+  # use layout_with_drl
+  plot(subnet.string.random, vertex.size=2, vertex.color = "blue", vertex.label=NA, layout=l2_subnet.string)
+  plot(subnet.string, vertex.size=2, vertex.color = clu.color, vertex.label=NA, layout=l2_subnet.string)
+  plot(clunet.reg.a, vertex.size=2, vertex.label=NA, edge.arrow.size=0.1, edge.curved=0.1, edge.color="grey50", layout=l2_subnet.string)
+  dev.off()
+  #invisible(readline(prompt="Press [enter] to continue"))
+}
+```
+
+# Rewiring
+```{r}
+set.seed(123)
+pheatmap(t(a.reg.mat[order(rowVars(a.reg.mat),decreasing = T)[1:50],order(rowVars(t(a.reg.mat)),decreasing = T)[1:1000]]), kmeans_k = 5, display_numbers = T, cutree_rows = 5, cutree_cols = 5, labels_col = id.map[colnames(a.reg.mat)[order(rowVars(a.reg.mat),decreasing = T)[1:50]],2], main = "Autistic regulatory network module heatmap")
+
+set.seed(123)
+pheatmap(t(n.reg.mat[order(rowVars(n.reg.mat),decreasing = T)[1:50],order(rowVars(t(n.reg.mat)),decreasing = T)[1:1000]]), kmeans_k = 5, display_numbers = T, cutree_rows = 5, cutree_cols = 5, labels_col = id.map[colnames(a.reg.mat)[order(rowVars(a.reg.mat),decreasing = T)[1:50]],2], main = "Normal regulatory network module heatmap")
+
+
+# Align networks
+an.reg.weight <- an.reg.mat[as.matrix(reg.tar.cor[,c("reg.ensg","tar.ensg")])]
+a.reg.weight <- a.reg.mat[as.matrix(reg.tar.cor[,c("reg.ensg","tar.ensg")])]
+n.reg.weight <- n.reg.mat[as.matrix(reg.tar.cor[,c("reg.ensg","tar.ensg")])]
+reg.tar.cor$an.reg.weight <- an.reg.weight
+reg.tar.cor$a.reg.weight <- a.reg.weight
+reg.tar.cor$n.reg.weight <- n.reg.weight
+aligned.net <- as.matrix(reg.tar.cor[,c("an.reg.weight", "a.reg.weight", "n.reg.weight")])
+# aligned.net<- aligned.net[rowSums(aligned.net)>0,]
+## correlation and weight show statistically significant correlation
+cor.test(abs(reg.tar.cor$cor[an.reg.weight>0]), an.reg.weight[an.reg.weight>0])
+cor.test(abs(reg.tar.cor$cor.autism[a.reg.weight>0]), a.reg.weight[a.reg.weight>0])
+cor.test(abs(reg.tar.cor$cor.normal[n.reg.weight>0]), n.reg.weight[n.reg.weight>0])
+```
+
+# Node clustering of rewired network
+```{r}
+net.reg.rewired <- graph_from_data_frame(data.frame(from=reg.tar.cor$regulator, to=reg.tar.cor$target, weight=reg.tar.cor$a.reg.weight - reg.tar.cor$n.reg.weight))
+net.reg.rewired <- delete.edges(net.reg.rewired, E(net.reg.rewired)[abs(weight)<0.1])
+V(net.reg.rewired)$size <- 1
+E(net.reg.rewired)$arrow.mode <- 0
+E(net.reg.rewired)$width <- abs(E(net.reg.rewired)$weight) * 3
+E(net.reg.rewired)$color <- colorRampPalette(c("blue", "red"))(10)[as.numeric(cut(E(net.reg.rewired)$weight, 10))]
+subnet.reg.rewired <- induced.subgraph(net.reg.rewired, V(net.reg.rewired)[components(net.reg.rewired)$membership == which.max(components(net.reg.rewired)$csize)])
+set.seed(1)
+l_subnet.reg.rewired <- layout_with_lgl(subnet.reg.rewired)
+plot(subnet.reg.rewired, vertex.label=NA, layout=l_subnet.reg.rewired)
+
+clu_subnet.reg.rewired <- cluster_louvain(as.undirected(subnet.reg.rewired, mode = "collapse"), weights = abs(E(subnet.reg.rewired)$weight))
+# color the vertices based on cluster memberships
+V(subnet.reg.rewired)$color <- adjustcolor("grey60", alpha.f = .5)
+tmp <- rep(0, max(clu_subnet.reg.rewired$membership))
+tmp[order(table(clu_subnet.reg.rewired$membership),decreasing = T)[1:11]] <- 1:11
+idx <- clu_subnet.reg.rewired$membership %in% order(table(clu_subnet.reg.rewired$membership),decreasing = T)[1:11]
+V(subnet.reg.rewired)$color[idx] <- brewer.pal(11, "Spectral")[tmp[clu_subnet.reg.rewired$membership[idx]]]
+# color the edges with the colors of their source nodes
+ecol <- V(subnet.reg.rewired)[get.data.frame(subnet.reg.rewired, what="edges")$from]$color
+# vertex size proportional to its degree
+deg_subnet.reg.rewired <- degree(subnet.reg.rewired, mode = "all")
+sort(deg_subnet.reg.rewired[deg_subnet.reg.rewired > 50])
+V(subnet.reg.rewired)$size <- log2(deg_subnet.reg.rewired + 1)
+
+plot(subnet.reg.rewired, vertex.label=NA, edge.color=ecol, layout=l_subnet.reg.rewired)
+
+# Plot degree distribution
+plot(sort(degree(subnet.reg.rewired, mode = "all")), xlab="Vertex index", ylab="Degree")
+
+# Reactome Pathway Analysis using ReactomePA
+entrezids <- hgnc2entrez[match(names(sort(deg_subnet.reg.rewired, decreasing = T)), hgnc2entrez$hgnc_symbol), "entrezgene"]
+entrezids <- entrezids[!is.na(entrezids)]
+entrezids <- unique(entrezids)
+x <- enrichPathway(entrezids)
+barplot(x)
+dotplot(x)
+enrichMap(x, layout=igraph::layout_with_fr, vertex.label.cex=1)
+x.df <- as.data.frame(x)
+
+# Visualize rewired pathways
+r.graphite <- graphite::pathways("hsapiens", "reactome")
+idx.graphite <- match(x.df$Description[1:50], names(r.graphite))
+# 1369 NGF
+idx.graphite[2] <- 1369
+for (i in 1:length(idx.graphite)){
+  idx.p <- idx.graphite[i]
+  comm.genes <- hgnc2entrez$hgnc_symbol[match(strsplit(x.df$geneID[i],"/")[[1]], hgnc2entrez$entrezgene)]
+  pathway <- graph_from_graphnel(pathwayGraph(convertIdentifiers(r.graphite[[idx.p]], "SYMBOL")))
+  idx <- match(comm.genes, names(V(pathway)))
+  idx <- idx[!is.na(idx)]
+  edges.df <- get.data.frame(pathway, what="edges")
+  V(pathway)$size <- 1
+  V(pathway)[idx]$size <-2
+  V(pathway)$color <- "grey60"
+  V(pathway)[idx]$color <- "green"
+  E(pathway)$arrow.size <- 0.1
+  E(pathway)$color <- "grey80"
+  E(pathway)[which(edges.df$from %in% names(V(pathway)[idx]) & edges.df$to %in% names(V(pathway)[idx]))]$color <- "green"
+  E(pathway)$width <- 1
+  subpathway <- induced.subgraph(pathway, idx)
+  edges.df2 <- get.data.frame(net.reg.rewired, what = "edges")
+  idx.e <- which(edges.df2$from %in% names(V(pathway)[idx]) & edges.df2$to %in% names(V(pathway)[idx]))
+  png(filename=paste0(getwd(), "/latex/figs_extended/reactome_rewired/", x.df$ID[i], ".png"), width = 2048, height = 1024)
+  if(length(idx.e) > 0){
+    subpathway2 <- add.edges(subpathway, edges = c(rbind(edges.df2$from[idx.e], edges.df2$to[idx.e])), color="blue", width=2)
+    idx.e2 <- which(!is.na(match(paste(edges.df2$from, edges.df2$to, sep = "--"), paste(edges.df$from, edges.df$to, sep = "--"))))
+    if(length(idx.e2)>0){
+      subpathway3 <- add.edges(subpathway2, edges = c(rbind(edges.df$from[idx.e2], edges.df$to[idx.e2])), color="red", width=4)
+      par(mfrow=c(2,2))
+      set.seed(1)
+      plot(pathway, vertex.label=NA, main=paste("pathway:", x.df$ID[i],",", vcount(pathway), "nodes"))
+      set.seed(1)
+      l_subpathway <- layout_with_fr(subpathway)
+      plot(subpathway, vertex.label=NA, layout=l_subpathway, main=paste("subpathway", vcount(subpathway), "nodes"))
+      plot(subpathway2, vertex.label=NA, layout=l_subpathway, main=paste("add", length(idx.e), "rewired edge(s)"))
+      plot(subpathway3, vertex.label=NA, layout=l_subpathway, main=paste("highlight", length(idx.e2), "rewired pathway edges"))
+    } else{
+      par(mfrow=c(1,3))
+      set.seed(1)
+      plot(pathway, vertex.label=NA, main=paste("pathway:", x.df$ID[i],",", vcount(pathway), "nodes"))
+      set.seed(1)
+      l_subpathway <- layout_with_fr(subpathway)
+      plot(subpathway, vertex.label=NA, layout=l_subpathway, main=paste("subpathway", vcount(subpathway), "nodes"))
+      plot(subpathway2, vertex.label=NA, layout=l_subpathway, main=paste("add", length(idx.e), "rewired edge(s)"))
+    } 
+  } else {
+    par(mfrow=c(1,2))
+    set.seed(1)
+    plot(pathway, vertex.label=NA, main=paste("pathway:", x.df$ID[i], ",", vcount(pathway), "nodes"))
+    set.seed(1)
+    l_subpathway <- layout_with_fr(subpathway)
+    plot(subpathway, vertex.label=NA, layout=l_subpathway, main=paste("subpathway", vcount(subpathway), "nodes"))
+  }
+  dev.off()
+  #invisible(readline(prompt="Press [enter] to continue"))
+}
+```
+
+# Compare rewired network with STRING database
+```{r}
+vertices.df <- get.data.frame(subnet.reg.rewired, what = "vertices")
+vertices.mapped <- string_db$map(vertices.df, "name", removeUnmappedRows = T)
+string_subnet.reg.rewired <- string_db$get_subnetwork(vertices.mapped$STRING_id)
+vertices.mapped <- vertices.mapped[match(names(V(string_subnet.reg.rewired)), vertices.mapped$STRING_id),]
+rownames(vertices.mapped) <- vertices.mapped$STRING_id
+mapped_subnet.reg.rewired <- induced.subgraph(subnet.reg.rewired, V(subnet.reg.rewired)[vertices.mapped[names(V(string_subnet.reg.rewired)), "name"]])
+mapped_subnet.reg.rewired <- permute.vertices(mapped_subnet.reg.rewired, match(names(V(mapped_subnet.reg.rewired)), vertices.mapped[names(V(string_subnet.reg.rewired)),"name"]))
+V(string_subnet.reg.rewired)$size <- V(mapped_subnet.reg.rewired)[vertices.mapped$name[match(names(V(string_subnet.reg.rewired)), vertices.mapped$STRING_id)]]$size
+V(string_subnet.reg.rewired)$color <- V(mapped_subnet.reg.rewired)[vertices.mapped$name[match(names(V(string_subnet.reg.rewired)), vertices.mapped$STRING_id)]]$color
+set.seed(1)
+l_string_subnet.reg.rewired <- layout_with_drl(string_subnet.reg.rewired)
+png(paste0(getwd(), "/latex/figs_extended/string-subnet_reg_rewired/", "2873.png"), width = 2048, height = 1024)
+par(mfrow=c(1,2))
+plot(string_subnet.reg.rewired, vertex.label=NA, layout=l_string_subnet.reg.rewired, main="Extracted network from STRING database")
+plot(mapped_subnet.reg.rewired, vertex.label=NA, layout=l_string_subnet.reg.rewired, main="Learned rewired regulatory network")
+dev.off()
+# degree correlation
+deg.reg <- degree(mapped_subnet.reg.rewired)
+deg.string <- degree(string_subnet.reg.rewired)
+names(deg.string) <- vertices.mapped$name[match(names(deg.string), vertices.mapped$STRING_id)]
+cor(deg.reg, deg.string[names(deg.reg)], method = "spearman")
+# Edge overlap # 664
+edges_string_subnet <- get.data.frame(string_subnet.reg.rewired, what="edges")
+edges_mapped_subnet <- get.data.frame(mapped_subnet.reg.rewired, what="edges")
+sum(!is.na(match(c(paste(vertices.mapped$name[match(edges_string_subnet$from, vertices.mapped$STRING_id)], vertices.mapped$name[match(edges_string_subnet$to, vertices.mapped$STRING_id)], sep="--"), paste(vertices.mapped$name[match(edges_string_subnet$to, vertices.mapped$STRING_id)], vertices.mapped$name[match(edges_string_subnet$from, vertices.mapped$STRING_id)], sep="--")), paste(edges_mapped_subnet$from, edges_mapped_subnet$to, sep = "--"))))
+ecount(mapped_subnet.reg.rewired)
+ecount(string_subnet.reg.rewired)
+
+
+
+# For each cluster
+cols_clu <- table(V(mapped_subnet.reg.rewired)$color)
+plot(1:length(cols_clu), pch=16, col=names(cols_clu), cex=cols_clu/min(cols_clu)*2)
+text(1:length(cols_clu), y=1:length(cols_clu), labels = cols_clu)
+res.clu_rewired <- matrix(nrow = length(cols_clu), ncol = 5)
+colnames(res.clu_rewired) <- c("num_vertices", "num_edges_string", "num_edges_reg", "comm_edges", "cor_degree")
+rownames(res.clu_rewired) <- names(cols_clu)
+for (col_clu in names(cols_clu)){
+  idx <- V(mapped_subnet.reg.rewired)$color == col_clu
+  res.clu_rewired[col_clu, "num_vertices"] <- sum(idx)
+  clunet.reg.rewired <- induced.subgraph(mapped_subnet.reg.rewired, V(mapped_subnet.reg.rewired)[idx])
+  res.clu_rewired[col_clu, "num_edges_reg"] <- ecount(clunet.reg.rewired)
+  idx <- V(string_subnet.reg.rewired)$color == col_clu
+  clunet.string.reg.rewired <- induced.subgraph(string_subnet.reg.rewired, V(string_subnet.reg.rewired)[idx])
+  res.clu_rewired[col_clu, "num_edges_string"] <- ecount(clunet.string.reg.rewired)
+  if(!identical(vertices.mapped[names(V(clunet.string.reg.rewired)), "name"], names(V(clunet.reg.rewired)))){
+    print(col_clu)
+    stop("vertices are not mapped in two networks")
+  }
+  res.clu_rewired[col_clu, "cor_degree"] <- cor(degree(clunet.reg.rewired), degree(clunet.string.reg.rewired))
+  edges.clunet.reg.rewired <- get.data.frame(clunet.reg.rewired, what="edges")
+  edges.clunet.string.reg.rewired <- get.data.frame(clunet.string.reg.rewired, what = "edges")
+  res.clu_rewired[col_clu, "comm_edges"] <- sum(!is.na(match(c(paste(edges.clunet.reg.rewired$from, edges.clunet.reg.rewired$to, sep = "--"), paste(edges.clunet.reg.rewired$to, edges.clunet.reg.rewired$from, sep = "--")), paste(vertices.mapped$name[match(edges.clunet.string.reg.rewired$from, vertices.mapped$STRING_id)], vertices.mapped$name[match(edges.clunet.string.reg.rewired$to, vertices.mapped$STRING_id)], sep = "--"))))
+  set.seed(1)
+  l_clunet.reg.rewired <- layout_with_fr(clunet.reg.rewired)
+  png(paste0(getwd(), "/latex/figs_extended/string-subnet_reg_rewired/", col_clu, ".png"), width = 2048, height = 1024)
+  par(mfrow=c(1,3))
+  set.seed(1)
+  plot(induced.subgraph(string_subnet.reg.rewired, V(string_subnet.reg.rewired)[sample(1:vcount(string_subnet.reg.rewired), res.clu_rewired[col_clu, "num_vertices"])]), vertex.label=NA, layout=l_clunet.reg.rewired, main=paste("Random subnetwork from STRING (", res.clu_rewired[col_clu, "num_vertices"], ")"))
+  plot(clunet.string.reg.rewired, vertex.label=NA, layout=l_clunet.reg.rewired, main=paste("Mapped STRING subnetwork (", res.clu_rewired[col_clu, "num_vertices"], ")"))
+  plot(clunet.reg.rewired, vertex.label=NA, layout=l_clunet.reg.rewired, main=paste("Learned regulatory subnetwork (", res.clu_rewired[col_clu, "num_vertices"], ")"))
+  dev.off()
+  
+  # Reactome Pathway Analysis using ReactomePA
+  entrezids <- hgnc2entrez$entrezgene[which(names(V(clunet.reg.rewired)) %in% hgnc2entrez$hgnc_symbol)]
+  entrezids <- entrezids[!is.na(entrezids)]
+  entrezids <- unique(entrezids)
+  x <- enrichPathway(entrezids)
+  png(paste0(getwd(), "/latex/figs_extended/string-subnet_reg_rewired/", col_clu, "_enrich_bar.png"), width = 2048, height = 1024)
+  barplot(x, showCategory=8)
+  dev.off()
+  png(paste0(getwd(), "/latex/figs_extended/string-subnet_reg_rewired/", col_clu, "_enrich_dot.png"), width = 2048, height = 1024)
+  dotplot(x, showCategory=15)
+  dev.off()
+  png(paste0(getwd(), "/latex/figs_extended/string-subnet_reg_rewired/", col_clu, "_enrich_map.png"), width = 2048, height = 1024)
+  enrichMap(x, layout=igraph::layout.kamada.kawai, vertex.label.cex = 1)
+  dev.off()
+}
+```
+
+
+# Edge clustering
+```{r}
+# For paper
+set.seed(1)
+pheatmap(aligned.net, kmeans_k = 5, display_numbers = T, labels_col = c("Mixed", "Autism", "Normal"))
+set.seed(1)
+km.aligned.net <- kmeans(aligned.net, 5)
+# Double check numbers shown in pheatmap
+tmp <- as.data.frame(aligned.net)
+tmp$clu <- km.aligned.net$cluster
+library(reshape)
+tmp1 <- melt(tmp, id="clu")
+cast(tmp1, clu~variable, mean)
+cast(tmp1, clu~variable, summary)
+fit <- sapply(1:length(km.aligned.net$size), function(x){
+  fit <- aov(value ~ variable, data=tmp1[tmp1$clu==x,])
+  summary(fit)[[1]][["F value"]][1]
+})
+
+# Variance analysis on summarized cluster values
+
+# Study cluster 5
+# ******************** Summary Network and Hierarchical Clustering (Good idea!) ****************
+set.seed(1)
+pheatmap(aligned.net[km.aligned.net$cluster == 5,], kmeans_k = 5, display_numbers = T)
+# visualize network
+edges <- data.frame(from=reg.tar.cor[km.aligned.net$cluster==5, "reg.ensg"], to=reg.tar.cor[km.aligned.net$cluster==5,"tar.ensg"], weight=a.reg.weight[km.aligned.net$cluster==5]-n.reg.weight[km.aligned.net$cluster==5])
+net <- graph_from_data_frame(edges)
+E(net)$arrow.size<-.1
+V(net)$size <- degree(net) / max(degree(net)) * 15
+V(net)$label<-id.map[names(V(net)),2]
+V(net)$label.color <- "red"
+V(net)$label.font <- 2
+net2 <- delete.vertices(net, V(net)[components(net)$membership!=which.max(components(net)$csize)])
+V(net2)$color <- grDevices::adjustcolor("grey60", alpha.f = .1)
+E(net2)$color <- grDevices::adjustcolor("grey50", alpha.f = .1)
+V(net2)$label <- NA
+V(net2)$label[degree(net2)>50] <- id.map[names(V(net2)),2][degree(net2)>50]
+V(net2)$label.color[degree(net2)>50] <- colorRampPalette(c("blue","red"), alpha=.8)(11)[as.numeric(cut(degree(net2)[degree(net2)>50], breaks = 11))]
+tkid<- tkplot(net2)
+layout.rewired.subreg <- tkplot.getcoords(tkid)
+plot(net2, layout=layout.rewired.subreg)
+plot(cluster_infomap(net), net, vertex.label=NA, edge.arrow.size=.2, layout=layout_with_fr)
+```
+
+Validation of 11 hub genes of cluster 5:
+```{r}
+id.map[names(V(net2))[degree(net2)>50],2]
+
+Relevance <- c("Elevated expression of SP1 could affect expression of several autism candidate genes.",
+"REST activation was observed in the brains of humans with ASD. Abnormal activation of RE-1 silencing transcription factor (REST), which suppresses the transcription of many neuronal genes.",
+"Multiple autism risk genes including USP7, PHF2, TNRC6B affect TP53.",
+"Bioinformatics predicted the binding of NFIA to ASD-associated rs1861972-rs1861973 A-C haplotype.",
+"miR-23a and miR-27a dysregulated in ASD promote cell proliferation in glioma cells via cooperative regulation of MXI1.",
+"As a global gene regulator, GABPA deficits linked to autism, Alzheimer's and Parkinson diseases.",
+"ELF1, involved in axonal guidance, is enriched for its binding motifs in the upstream regions of ASD gene-enriched modules.",
+"KDM5A and six other genes each ascribed an essential role in the regulation of H3K4 methylation, are linked to rare monogenic forms of neurodevelopmental disease, including intellectual disability and autism.",
+"The protein encoded by this gene plays a key role in brain development; an in-frame deletion variant in PHF8 was found to segregate with high-functioning autism without other clinical features in a multiplex ASD family.",
+"Ten (14%) individuals postive for TCF12 mutations had developmental delay or learning disability, which in two cases was associated with autism.",
+"SOX2 codes for transcription factors that influence neural stem cell growth and brain development.SOX2 is directly affected by autism gene CHD8.")
+
+Ref <- c("\\cite{Thanseem2012}",
+"\\cite{Katayama2016}",
+"\\cite{Crawley,Hao2015}",
+"\\cite{Choi2012}",
+"\\cite{Hicks2016,Xu2013}",
+"\\cite{Perdomo-Sabogal2016}",
+"\\cite{Parikshak2013}",
+"\\cite{Shen2014}",
+"\\cite{Nava2012}",
+"\\cite{Sharma2013}",
+"\\cite{Maier2009,Wang2017}")
+
+Url <- c("https://www.ncbi.nlm.nih.gov/pubmed/22030357",
+"http://www.nature.com/nature/journal/v537/n7622/full/nature19357.html",
+"https://gene.sfari.org/GeneDetail/USP7 and http://www.cell.com/trends/genetics/fulltext/S0168-9525(16)00002-0", 
+"https://academic.oup.com/hmg/article/21/7/1566/2900724/Cut-like-homeobox-1-and-nuclear-factor-I-B-mediate",
+"http://bmcpediatr.biomedcentral.com/articles/10.1186/s12887-016-0586-x and
+https://www.spandidos-publications.com/10.3892/ijo.2012.1742",
+"https://academic.oup.com/mbe/article/33/5/1231/2579702/Human-Lineage-Specific-Transcriptional-Regulation and https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4049305/",
+"http://www.sciencedirect.com/science/article/pii/S0092867413013494",
+"http://rstb.royalsocietypublishing.org/content/369/1652/20130514.long",
+"https://gene.sfari.org/GeneDetail/PHF8 and http://www.nature.com/tp/journal/v2/n10/full/tp2012102a.html",
+"http://www.nature.com/ng/journal/v45/n3/full/ng.2531.html",
+"https://molecularautism.biomedcentral.com/articles/10.1186/s13229-017-0124-1 and http://onlinelibrary.wiley.com/doi/10.1016/j.febslet.2009.10.036/full")
+
+validation_tbl <- cbind(Gene=id.map[names(V(net2))[degree(net2)>50],2], `Relevance to Autism`=Relevance, Reference=Ref, URL=Url)
+xtable(validation_tbl)
+# SP1: https://www.ncbi.nlm.nih.gov/pubmed/22030357
+# REST: http://www.nature.com/nature/journal/v537/n7622/full/nature19357.html
+# TP53:https://gene.sfari.org/GeneDetail/USP7  
+#      http://www.cell.com/trends/genetics/fulltext/S0168-9525(16)00002-0
+# NFYA: https://academic.oup.com/hmg/article/21/7/1566/2900724/Cut-like-homeobox-1-and-nuclear-factor-I-B-mediate
+# MXI1: ? http://bmcpediatr.biomedcentral.com/articles/10.1186/s12887-016-0586-x
+#       + https://www.spandidos-publications.com/10.3892/ijo.2012.1742
+# GABPA: https://academic.oup.com/mbe/article/33/5/1231/2579702/Human-Lineage-Specific-Transcriptional-Regulation
+#        https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4049305/
+# ELF1: http://www.sciencedirect.com/science/article/pii/S0092867413013494
+# KDM5A: http://rstb.royalsocietypublishing.org/content/369/1652/20130514.long
+# PHF8: https://gene.sfari.org/GeneDetail/PHF8
+#       http://www.nature.com/tp/journal/v2/n10/full/tp2012102a.html
+# TCF12: http://www.nature.com/ng/journal/v45/n3/full/ng.2531.html  one case
+# SOX2: https://molecularautism.biomedcentral.com/articles/10.1186/s13229-017-0124-1
+#       http://onlinelibrary.wiley.com/doi/10.1016/j.febslet.2009.10.036/full
+
+# TP53 only has 79 out edges?
+ensg <- id.map[match("TP53",id.map$hgnc_symbol), 1]
+neigh.nodes <- neighbors(net2, V(net2)[ensg], mode="all")
+inci.edges <- incident_edges(net2, V(net2)[ensg], mode = "out")
+net.TP53 <- induced.subgraph(net2, c(match(ensg, names(V(net2))),match(neigh.nodes, V(net2))))
+plot(net.TP53)
+
+# REST
+# Gene modules regulated by REST
+set.seed(123)
+pheatmap(aligned.net[grep("^REST-",rownames(aligned.net)),], display_numbers = T, kmeans_k = 5,labels_col = c("mixed", "autism", "normal"), main="")
+set.seed(123)
+kmeans(aligned.net, 5)$cluster[which(rownames(aligned.net)=="REST-TP53")]
+```
+
+Sensitivity
+```{r}
+gene_scores <- read.csv("SFARI/gene-score-sub.csv", header = T, as.is = T)
+
+common.genes <- intersect(id.map[names(V(net2)),2], gene_scores$Gene.Symbol)
+common.ensg <- id.map[match(common.genes,id.map$hgnc_symbol),1]
+V(net2)$size <- 1
+V(net2)[common.ensg]$size <- 3
+V(net2)[common.ensg]$color <- grDevices::adjustcolor("green")
+common.ensg <- common.ensg[degree(net2)[common.ensg]>10]
+V(net2)[common.ensg]$size <- 10
+V(net2)[common.ensg]$color <- grDevices::adjustcolor("green",0.2)
+V(net2)$label<-NA
+V(net2)[common.ensg]$label <- id.map[common.ensg,2]
+V(net2)[common.ensg]$label.color <- "red"
+V(net2)[common.ensg]$label.font <- 2
+plot(net2, layout=layout.rewired.subreg)
+```
