@@ -1,5 +1,5 @@
 # RCRN
-Reconstruct Context-specific Regulatory Network by integrating transcriptomic profiling with public gene regulatory networks
+Reconstructing context-specific gene regulatory network and identifying modules and network rewiring through data integration
 
 http://www.sciencedirect.com/science/article/pii/S1046202317300427
 
